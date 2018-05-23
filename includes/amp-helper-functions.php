@@ -487,6 +487,7 @@ function amp_get_content_sanitizers( $post = null ) {
 			'AMP_Audio_Sanitizer'             => array(),
 			'AMP_Block_Sanitizer'             => array(),
 			'AMP_Playbuzz_Sanitizer'          => array(),
+			'AMP_Embed_Sanitizer'             => array(),
 			'AMP_Iframe_Sanitizer'            => array(
 				'add_placeholder' => true,
 			),
