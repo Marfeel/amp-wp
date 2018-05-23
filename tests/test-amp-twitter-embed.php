@@ -121,7 +121,7 @@ class AMP_Twitter_Embed_Test extends WP_UnitTestCase {
 	 */
 	public function test__raw_embed_sanitizer( $source, $expected ) {
 		$dom   = AMP_DOM_Utils::get_dom_from_content( $source );
-		$embed = new AMP_Instagram_Embed_Handler();
+		$embed = new AMP_Twitter_Embed_Handler();
 		$embed->sanitize_raw_embeds( $dom );
 		$content = AMP_DOM_Utils::get_content_from_dom( $dom );
 		$this->assertEquals( $expected, $content );
