@@ -68,13 +68,12 @@ class AMP_Theme_Support {
 	public static $purged_amp_query_vars = array();
 
 	/**
-	 * Headers sent (or attempted to be sent).
+	 * Start time when init was called.
 	 *
-	 * @since 0.7
-	 * @see AMP_Theme_Support::send_header()
-	 * @var array[]
+	 * @since 1.0
+	 * @var float
 	 */
-	public static $headers_sent = array();
+	public static $init_start_time;
 
 	/**
 	 * Whether output buffering has started.
@@ -86,11 +85,16 @@ class AMP_Theme_Support {
 
 	/**
 	 * Initialize.
+	 *
+	 * @since 0.7
 	 */
 	public static function init() {
 		if ( ! current_theme_supports( 'amp' ) ) {
 			return;
 		}
+
+		self::$init_start_time = microtime( true );
+		AMP_Validation_Utils::init();
 
 		self::purge_amp_query_vars();
 		self::handle_xhr_request();
@@ -343,45 +347,6 @@ class AMP_Theme_Support {
 	}
 
 	/**
-	 * Send an HTTP response header.
-	 *
-	 * This largely exists to facilitate unit testing but it also provides a better interface for sending headers.
-	 *
-	 * @since 0.7.0
-	 *
-	 * @param string $name  Header name.
-	 * @param string $value Header value.
-	 * @param array  $args {
-	 *     Args to header().
-	 *
-	 *     @type bool $replace     Whether to replace a header previously sent. Default true.
-	 *     @type int  $status_code Status code to send with the sent header.
-	 * }
-	 * @return bool Whether the header was sent.
-	 */
-	public static function send_header( $name, $value, $args = array() ) {
-		$args = array_merge(
-			array(
-				'replace'     => true,
-				'status_code' => null,
-			),
-			$args
-		);
-
-		self::$headers_sent[] = array_merge( compact( 'name', 'value' ), $args );
-		if ( headers_sent() ) {
-			return false;
-		}
-
-		header(
-			sprintf( '%s: %s', $name, $value ),
-			$args['replace'],
-			$args['status_code']
-		);
-		return true;
-	}
-
-	/**
 	 * Hook into a POST form submissions, such as the comment form or some other form submission.
 	 *
 	 * @since 0.7.0
@@ -401,7 +366,7 @@ class AMP_Theme_Support {
 		// Send AMP response header.
 		$origin = wp_validate_redirect( wp_sanitize_redirect( esc_url_raw( self::$purged_amp_query_vars['__amp_source_origin'] ) ) );
 		if ( $origin ) {
-			self::send_header( 'AMP-Access-Control-Allow-Source-Origin', $origin, array( 'replace' => true ) );
+			AMP_Response_Headers::send_header( 'AMP-Access-Control-Allow-Source-Origin', $origin, array( 'replace' => true ) );
 		}
 
 		// Intercept POST requests which redirect.
@@ -550,8 +515,8 @@ class AMP_Theme_Support {
 			$absolute_location .= '#' . $parsed_location['fragment'];
 		}
 
-		self::send_header( 'AMP-Redirect-To', $absolute_location );
-		self::send_header( 'Access-Control-Expose-Headers', 'AMP-Redirect-To' );
+		AMP_Response_Headers::send_header( 'AMP-Redirect-To', $absolute_location );
+		AMP_Response_Headers::send_header( 'Access-Control-Expose-Headers', 'AMP-Redirect-To' );
 
 		wp_send_json_success();
 	}
@@ -794,7 +759,7 @@ class AMP_Theme_Support {
 
 		// Continue to show default link to wp-login when user is not logged-in.
 		if ( get_option( 'comment_registration' ) && ! is_user_logged_in() ) {
-			return $link;
+			return $args['before'] . $link . $args['after'];
 		}
 
 		$state_id  = self::get_comment_form_state_id( get_the_ID() );
@@ -815,7 +780,7 @@ class AMP_Theme_Support {
 			esc_attr( sprintf( $args['reply_to_text'], $comment->comment_author ) ),
 			$args['reply_text']
 		);
-		return $link;
+		return $args['before'] . $link . $args['after'];
 	}
 
 	/**
@@ -970,7 +935,7 @@ class AMP_Theme_Support {
 	public static function start_output_buffering() {
 		/*
 		 * Disable the New Relic Browser agent on AMP responses.
-		 * This prevents th New Relic from causing invalid AMP responses due the NREUM script it injects after the meta charset:
+		 * This prevents the New Relic from causing invalid AMP responses due the NREUM script it injects after the meta charset:
 		 * https://docs.newrelic.com/docs/browser/new-relic-browser/troubleshooting/google-amp-validator-fails-due-3rd-party-script
 		 * Sites with New Relic will need to specially configure New Relic for AMP:
 		 * https://docs.newrelic.com/docs/browser/new-relic-browser/installation/monitor-amp-pages-new-relic-browser
@@ -1006,6 +971,8 @@ class AMP_Theme_Support {
 	 * @return string Processed Response.
 	 */
 	public static function finish_output_buffering( $response ) {
+		AMP_Response_Headers::send_server_timing( 'amp_output_buffer', -self::$init_start_time, 'AMP Output Buffer' );
+
 		self::$is_output_buffering = false;
 		return self::prepare_response( $response );
 	}
@@ -1061,7 +1028,7 @@ class AMP_Theme_Support {
 			return $response;
 		}
 
-		$is_validation_debug_mode = ! empty( $_REQUEST[ AMP_Validation_Utils::DEBUG_QUERY_VAR ] ); // WPCS: csrf ok.
+		$is_validation_debug_mode = isset( $_REQUEST[ AMP_Validation_Utils::DEBUG_QUERY_VAR ] ); // WPCS: csrf ok.
 
 		$args = array_merge(
 			array(
@@ -1073,6 +1040,8 @@ class AMP_Theme_Support {
 			),
 			$args
 		);
+
+		$dom_parse_start = microtime( true );
 
 		/*
 		 * Make sure that <meta charset> is present in output prior to parsing.
@@ -1105,8 +1074,11 @@ class AMP_Theme_Support {
 			$dom->documentElement->setAttribute( 'amp', '' );
 		}
 
+		AMP_Response_Headers::send_server_timing( 'amp_dom_parse', -$dom_parse_start, 'AMP DOM Parse' );
+
 		$assets = AMP_Content_Sanitizer::sanitize_document( $dom, self::$sanitizer_classes, $args );
 
+		$dom_serialize_start = microtime( true );
 		self::ensure_required_markup( $dom );
 
 		// @todo If 'utf-8' is not the blog charset, then we'll need to do some character encoding conversation or "entityification".
@@ -1166,6 +1138,8 @@ class AMP_Theme_Support {
 				1
 			);
 		}
+
+		AMP_Response_Headers::send_server_timing( 'amp_dom_serialize', -$dom_serialize_start, 'AMP DOM Serialize' );
 
 		return $response;
 	}

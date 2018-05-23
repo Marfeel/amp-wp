@@ -146,6 +146,13 @@ class AMP_Validation_Utils {
 	const VALIDATION_ERRORS_META_BOX = 'amp_validation_errors';
 
 	/**
+	 * The name of the REST API field with the AMP validation results.
+	 *
+	 * @var string
+	 */
+	const VALIDITY_REST_FIELD_NAME = 'amp_validity';
+
+	/**
 	 * The errors encountered when validating.
 	 *
 	 * @var array[][] {
@@ -173,7 +180,9 @@ class AMP_Validation_Utils {
 	/**
 	 * Post IDs for posts that have been updated which need to be re-validated.
 	 *
-	 * @var int[]
+	 * Keys are post IDs and values are whether the post has been re-validated.
+	 *
+	 * @var bool[]
 	 */
 	public static $posts_pending_frontend_validation = array();
 
@@ -185,6 +194,13 @@ class AMP_Validation_Utils {
 	 * @var array[]
 	 */
 	protected static $current_hook_source_stack = array();
+
+	/**
+	 * Index for where block appears in a post's content.
+	 *
+	 * @var int
+	 */
+	protected static $block_content_index = 0;
 
 	/**
 	 * Hook source stack.
@@ -202,13 +218,12 @@ class AMP_Validation_Utils {
 	 * @return void
 	 */
 	public static function init() {
-		if ( current_theme_supports( 'amp' ) ) {
-			add_action( 'init', array( __CLASS__, 'register_post_type' ) );
-			add_filter( 'dashboard_glance_items', array( __CLASS__, 'filter_dashboard_glance_items' ) );
-			add_action( 'rightnow_end', array( __CLASS__, 'print_dashboard_glance_styles' ) );
-			add_action( 'save_post', array( __CLASS__, 'handle_save_post_prompting_validation' ), 10, 2 );
-		}
-
+		add_action( 'init', array( __CLASS__, 'register_post_type' ) );
+		add_filter( 'dashboard_glance_items', array( __CLASS__, 'filter_dashboard_glance_items' ) );
+		add_action( 'rightnow_end', array( __CLASS__, 'print_dashboard_glance_styles' ) );
+		add_action( 'save_post', array( __CLASS__, 'handle_save_post_prompting_validation' ), 10, 2 );
+		add_action( 'enqueue_block_editor_assets', array( __CLASS__, 'enqueue_block_validation' ) );
+		add_action( 'rest_api_init', array( __CLASS__, 'add_rest_api_fields' ) );
 		add_action( 'edit_form_top', array( __CLASS__, 'print_edit_form_validation_status' ), 10, 2 );
 		add_action( 'all_admin_notices', array( __CLASS__, 'plugin_notice' ) );
 		add_filter( 'manage_' . self::POST_TYPE_SLUG . '_posts_columns', array( __CLASS__, 'add_post_columns' ) );
@@ -217,6 +232,7 @@ class AMP_Validation_Utils {
 		add_filter( 'bulk_actions-edit-' . self::POST_TYPE_SLUG, array( __CLASS__, 'add_bulk_action' ), 10, 2 );
 		add_filter( 'handle_bulk_actions-edit-' . self::POST_TYPE_SLUG, array( __CLASS__, 'handle_bulk_action' ), 10, 3 );
 		add_action( 'admin_notices', array( __CLASS__, 'remaining_error_notice' ) );
+		add_action( 'admin_notices', array( __CLASS__, 'persistent_object_caching_notice' ) );
 		add_action( 'post_action_' . self::RECHECK_ACTION, array( __CLASS__, 'handle_inline_recheck' ) );
 		add_action( 'admin_menu', array( __CLASS__, 'remove_publish_meta_box' ) );
 		add_action( 'admin_menu', array( __CLASS__, 'add_admin_menu_validation_status_count' ) );
@@ -306,6 +322,16 @@ class AMP_Validation_Utils {
 
 		add_filter( 'do_shortcode_tag', array( __CLASS__, 'decorate_shortcode_source' ), -1, 2 );
 		add_filter( 'amp_content_sanitizers', array( __CLASS__, 'add_validation_callback' ) );
+
+		$do_blocks_priority  = has_filter( 'the_content', 'do_blocks' );
+		$is_gutenberg_active = (
+			false !== $do_blocks_priority
+			&&
+			class_exists( 'WP_Block_Type_Registry' )
+		);
+		if ( $is_gutenberg_active ) {
+			add_filter( 'the_content', array( __CLASS__, 'add_block_source_comments' ), $do_blocks_priority - 1 );
+		}
 	}
 
 	/**
@@ -322,9 +348,11 @@ class AMP_Validation_Utils {
 			! wp_is_post_autosave( $post )
 			&&
 			! wp_is_post_revision( $post )
+			&&
+			! isset( self::$posts_pending_frontend_validation[ $post_id ] )
 		);
 		if ( $should_validate_post ) {
-			self::$posts_pending_frontend_validation[] = $post_id;
+			self::$posts_pending_frontend_validation[ $post_id ] = true;
 
 			// The reason for shutdown is to ensure that all postmeta changes have been saved, including whether AMP is enabled.
 			if ( ! has_action( 'shutdown', array( __CLASS__, 'validate_queued_posts_on_frontend' ) ) ) {
@@ -337,29 +365,39 @@ class AMP_Validation_Utils {
 	 * Validate the posts pending frontend validation.
 	 *
 	 * @see AMP_Validation_Utils::handle_save_post_prompting_validation()
+	 *
+	 * @return array Mapping of post ID to the result of validating or storing the validation result.
 	 */
 	public static function validate_queued_posts_on_frontend() {
 		$posts = array_filter(
-			array_map( 'get_post', self::$posts_pending_frontend_validation ),
+			array_map( 'get_post', array_keys( array_filter( self::$posts_pending_frontend_validation ) ) ),
 			function( $post ) {
 				return $post && post_supports_amp( $post ) && 'trash' !== $post->post_status;
 			}
 		);
 
+		$validation_posts = array();
+
 		// @todo Only validate the first and then queue the rest in WP Cron?
 		foreach ( $posts as $post ) {
 			$url = amp_get_permalink( $post->ID );
 			if ( ! $url ) {
+				$validation_posts[ $post->ID ] = new WP_Error( 'no_amp_permalink' );
 				continue;
 			}
+
+			// Prevent re-validating.
+			self::$posts_pending_frontend_validation[ $post->ID ] = false;
 
 			$validation_errors = self::validate_url( $url );
 			if ( is_wp_error( $validation_errors ) ) {
-				continue;
+				$validation_posts[ $post->ID ] = $validation_errors;
+			} else {
+				$validation_posts[ $post->ID ] = self::store_validation_errors( $validation_errors, $url );
 			}
-
-			self::store_validation_errors( $validation_errors, $url );
 		}
+
+		return $validation_posts;
 	}
 
 	/**
@@ -413,7 +451,9 @@ class AMP_Validation_Utils {
 			$node = $data['node'];
 			unset( $data['node'] );
 			$data['node_name'] = $node->nodeName;
-			$data['sources']   = self::locate_sources( $node );
+			if ( ! isset( $data['sources'] ) ) {
+				$data['sources'] = self::locate_sources( $node );
+			}
 			if ( $node->parentNode ) {
 				$data['parent_name'] = $node->parentNode->nodeName;
 			}
@@ -535,64 +575,41 @@ class AMP_Validation_Utils {
 			return;
 		}
 
-		$url                    = null;
-		$validation_status_post = null;
-		$validation_errors      = array();
-
-		// Incorporate frontend validation status if there is a known URL for the post.
-		if ( is_post_type_viewable( $post->post_type ) ) {
-			$url = amp_get_permalink( $post->ID );
-
-			$validation_status_post = self::get_validation_status_post( $url );
-			if ( $validation_status_post ) {
-				$data = json_decode( $validation_status_post->post_content, true );
-				if ( is_array( $data ) ) {
-					$validation_errors = array_merge( $validation_errors, $data );
-				}
-			}
+		// Skip if the post type is not viewable on the frontend, since we need a permalink to validate.
+		if ( ! is_post_type_viewable( $post->post_type ) ) {
+			return;
 		}
 
-		// If no results from URL are available, validate post content outside frontend context.
-		if ( empty( $validation_errors ) && post_type_supports( $post->post_type, 'editor' ) ) {
-			self::process_markup( $post->post_content );
-			$validation_errors = array_merge(
-				$validation_errors,
-				self::$validation_errors
-			);
-			self::reset_validation_results();
+		$url                    = amp_get_permalink( $post->ID );
+		$validation_status_post = self::get_validation_status_post( $url );
 
-			// Make sure original post is restored after applying shortcodes which could change it.
-			$GLOBALS['post'] = $post; // WPCS: override ok.
-			setup_postdata( $post );
+		// No validation status exists yet, so there is nothing to show.
+		if ( ! $validation_status_post ) {
+			return;
 		}
 
-		if ( empty( $validation_errors ) ) {
+		$validation_errors = json_decode( $validation_status_post->post_content, true );
+
+		// No validation errors so abort.
+		if ( empty( $validation_errors ) || ! is_array( $validation_errors ) ) {
 			return;
 		}
 
 		echo '<div class="notice notice-warning">';
 		echo '<p>';
 		esc_html_e( 'Warning: There is content which fails AMP validation; it will be stripped when served as AMP.', 'amp' );
-		if ( $validation_status_post || $url ) {
-			if ( $validation_status_post ) {
-				echo sprintf(
-					' <a href="%s" target="_blank">%s</a>',
-					esc_url( get_edit_post_link( $validation_status_post ) ),
-					esc_html__( 'Details', 'amp' )
-				);
-			}
-			if ( $url ) {
-				if ( $validation_status_post ) {
-					echo ' | ';
-				}
-				echo sprintf(
-					' <a href="%s" aria-label="%s" target="_blank">%s</a>',
-					esc_url( self::get_debug_url( $url ) ),
-					esc_attr__( 'Validate URL on frontend but without invalid elements/attributes removed', 'amp' ),
-					esc_html__( 'Debug', 'amp' )
-				);
-			}
-		}
+		echo sprintf(
+			' <a href="%s" target="_blank">%s</a>',
+			esc_url( get_edit_post_link( $validation_status_post ) ),
+			esc_html__( 'Details', 'amp' )
+		);
+		echo ' | ';
+		echo sprintf(
+			' <a href="%s" aria-label="%s" target="_blank">%s</a>',
+			esc_url( self::get_debug_url( $url ) ),
+			esc_attr__( 'Validate URL on frontend but without invalid elements/attributes removed', 'amp' ),
+			esc_html__( 'Debug', 'amp' )
+		);
 		echo '</p>';
 
 		$results      = self::summarize_validation_errors( array_unique( $validation_errors, SORT_REGULAR ) );
@@ -617,6 +634,29 @@ class AMP_Validation_Utils {
 		}
 
 		echo '</div>';
+	}
+
+	/**
+	 * Gets the validation errors for a given post.
+	 *
+	 * These are stored in a custom post type.
+	 * If none exist, returns null.
+	 *
+	 * @param WP_Post $post The post for which to get the validation errors.
+	 * @return array|null $errors The validation errors, if they exist.
+	 */
+	public static function get_existing_validation_errors( $post ) {
+		if ( is_post_type_viewable( $post->post_type ) ) {
+			$url                    = amp_get_permalink( $post->ID );
+			$validation_status_post = self::get_validation_status_post( $url );
+			if ( $validation_status_post ) {
+				$data = json_decode( $validation_status_post->post_content, true );
+				if ( is_array( $data ) ) {
+					return $data;
+				}
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -697,6 +737,82 @@ class AMP_Validation_Utils {
 		foreach ( $comments as $comment ) {
 			$comment->parentNode->removeChild( $comment );
 		}
+	}
+
+	/**
+	 * Add block source comments.
+	 *
+	 * @param string $content Content prior to blocks being processed.
+	 * @return string Content with source comments added.
+	 */
+	public static function add_block_source_comments( $content ) {
+		self::$block_content_index = 0;
+
+		$start_block_pattern = implode( '', array(
+			'#<!--\s+',
+			'(?P<closing>/)?',
+			'wp:(?P<name>\S+)',
+			'(?:\s+(?P<attributes>\{.*?\}))?',
+			'\s+(?P<self_closing>\/)?',
+			'-->#s',
+		) );
+
+		return preg_replace_callback(
+			$start_block_pattern,
+			array( __CLASS__, 'handle_block_source_comment_replacement' ),
+			$content
+		);
+	}
+
+	/**
+	 * Handle block source comment replacement.
+	 *
+	 * @see \AMP_Validation_Utils::add_block_source_comments()
+	 * @param array $matches Matches.
+	 * @return string Replaced.
+	 */
+	protected static function handle_block_source_comment_replacement( $matches ) {
+		$replaced = $matches[0];
+
+		// Obtain source information for block.
+		$source = array(
+			'block_name' => $matches['name'],
+			'post_id'    => get_the_ID(),
+		);
+
+		if ( empty( $matches['closing'] ) ) {
+			$source['block_content_index'] = self::$block_content_index;
+			self::$block_content_index++;
+		}
+
+		// Make implicit core namespace explicit.
+		$is_implicit_core_namespace = ( false === strpos( $source['block_name'], '/' ) );
+		$source['block_name']       = $is_implicit_core_namespace ? 'core/' . $source['block_name'] : $source['block_name'];
+
+		if ( ! empty( $matches['attributes'] ) ) {
+			$source['block_attrs'] = json_decode( $matches['attributes'] );
+		}
+		$block_type = WP_Block_Type_Registry::get_instance()->get_registered( $source['block_name'] );
+		if ( $block_type && $block_type->is_dynamic() ) {
+			$callback_source = self::get_source( $block_type->render_callback );
+			if ( $callback_source ) {
+				$source = array_merge(
+					$source,
+					$callback_source
+				);
+			}
+		}
+
+		if ( ! empty( $matches['closing'] ) ) {
+			$replaced .= self::get_source_comment( $source, false );
+		} else {
+			$replaced = self::get_source_comment( $source, true ) . $replaced;
+			if ( ! empty( $matches['self_closing'] ) ) {
+				unset( $source['block_content_index'] );
+				$replaced .= self::get_source_comment( $source, false );
+			}
+		}
+		return $replaced;
 	}
 
 	/**
@@ -1097,8 +1213,6 @@ class AMP_Validation_Utils {
 	/**
 	 * Whether to validate the front end response.
 	 *
-	 * Either the user has the capability and the query var is present.
-	 *
 	 * @return boolean Whether to validate.
 	 */
 	public static function should_validate_response() {
@@ -1192,7 +1306,7 @@ class AMP_Validation_Utils {
 	 *
 	 * @param array  $validation_errors Validation errors.
 	 * @param string $url               URL on which the validation errors occurred.
-	 * @return int|null $post_id The post ID of the custom post type used, or null.
+	 * @return int|WP_Error $post_id The post ID of the custom post type used, null if post was deleted due to no validation errors, or WP_Error on failure.
 	 * @global WP $wp
 	 */
 	public static function store_validation_errors( $validation_errors, $url ) {
@@ -1237,9 +1351,9 @@ class AMP_Validation_Utils {
 			'post_name'    => $post_name,
 			'post_content' => $encoded_errors,
 			'post_status'  => 'publish',
-		) ) );
-		if ( ! $post_id ) {
-			return null;
+		) ), true );
+		if ( is_wp_error( $post_id ) ) {
+			return $post_id;
 		}
 		if ( ! in_array( $url, get_post_meta( $post_id, self::AMP_URL_META, false ), true ) ) {
 			add_post_meta( $post_id, self::AMP_URL_META, wp_slash( $url ), false );
@@ -1369,7 +1483,7 @@ class AMP_Validation_Utils {
 				);
 				printf(
 					'<div class="notice notice-warning is-dismissible"><p>%s %s %s</p><button type="button" class="notice-dismiss"><span class="screen-reader-text">%s</span></button></div>',
-					esc_html( _n( 'Warning: The following plugin may be incompatible with AMP:', 'Warning: The following plugins may be incompatible with AMP: ', count( $invalid_plugins ), 'amp' ) ),
+					esc_html( _n( 'Warning: The following plugin may be incompatible with AMP:', 'Warning: The following plugins may be incompatible with AMP:', count( $invalid_plugins ), 'amp' ) ),
 					implode( ', ', $reported_plugins ),
 					$more_details_link,
 					esc_html__( 'Dismiss this notice.', 'amp' )
@@ -1845,4 +1959,123 @@ class AMP_Validation_Utils {
 		);
 	}
 
+	/**
+	 * Enqueues the block validation script.
+	 *
+	 * @return void
+	 */
+	public static function enqueue_block_validation() {
+		$slug = 'amp-block-validation';
+
+		wp_enqueue_script(
+			$slug,
+			amp_get_asset_url( "js/{$slug}.js" ),
+			array( 'underscore' ),
+			AMP__VERSION,
+			true
+		);
+
+		$data = wp_json_encode( array(
+			'i18n'                 => gutenberg_get_jed_locale_data( 'amp' ), // @todo POT file.
+			'ampValidityRestField' => self::VALIDITY_REST_FIELD_NAME,
+		) );
+		wp_add_inline_script( $slug, sprintf( 'ampBlockValidation.boot( %s );', $data ) );
+	}
+
+	/**
+	 * Adds fields to the REST API responses, in order to display validation errors.
+	 *
+	 * @return void
+	 */
+	public static function add_rest_api_fields() {
+		if ( amp_is_canonical() ) {
+			$object_types = get_post_types_by_support( 'editor' );
+		} else {
+			$object_types = array_intersect(
+				get_post_types_by_support( 'amp' ),
+				get_post_types( array(
+					'show_in_rest' => true,
+				) )
+			);
+		}
+
+		register_rest_field(
+			$object_types,
+			self::VALIDITY_REST_FIELD_NAME,
+			array(
+				'get_callback' => array( __CLASS__, 'get_amp_validity_rest_field' ),
+				'schema'       => array(
+					'description' => __( 'AMP validity status', 'amp' ),
+					'type'        => 'object',
+				),
+			)
+		);
+	}
+
+	/**
+	 * Adds a field to the REST API responses to display the validation status.
+	 *
+	 * First, get existing errors for the post.
+	 * If there are none, validate the post and return any errors.
+	 *
+	 * @param array           $post_data  Data for the post.
+	 * @param string          $field_name The name of the field to add.
+	 * @param WP_REST_Request $request    The name of the field to add.
+	 * @return array|null $validation_data Validation data if it's available, or null.
+	 */
+	public static function get_amp_validity_rest_field( $post_data, $field_name, $request ) {
+		unset( $field_name );
+		if ( ! current_user_can( 'edit_post', $post_data['id'] ) ) {
+			return null;
+		}
+		$post = get_post( $post_data['id'] );
+
+		$validation_status_post = null;
+		if ( in_array( $request->get_method(), array( 'PUT', 'POST' ), true ) ) {
+			if ( ! isset( self::$posts_pending_frontend_validation[ $post->ID ] ) ) {
+				self::$posts_pending_frontend_validation[ $post->ID ] = true;
+			}
+			$results = self::validate_queued_posts_on_frontend();
+			if ( isset( $results[ $post->ID ] ) && is_int( $results[ $post->ID ] ) ) {
+				$validation_status_post = get_post( $results[ $post->ID ] );
+			}
+		}
+
+		if ( empty( $validation_status_post ) ) {
+			// @todo Consider process_markup() if not post type is not viewable and if post type supports editor.
+			$validation_status_post = self::get_validation_status_post( amp_get_permalink( $post->ID ) );
+		}
+
+		if ( ! $validation_status_post ) {
+			$field = array(
+				'errors' => array(),
+				'link'   => null,
+			);
+		} else {
+			$field = array(
+				'errors' => json_decode( $validation_status_post->post_content, true ),
+				'link'   => get_edit_post_link( $validation_status_post->ID, 'raw' ),
+			);
+		}
+
+		return $field;
+	}
+
+	/**
+	 * Outputs an admin notice if persistent object cache is not present.
+	 *
+	 * @return void
+	 */
+	public static function persistent_object_caching_notice() {
+		if ( ! wp_using_ext_object_cache() && 'toplevel_page_amp-options' === get_current_screen()->id ) {
+			printf(
+				'<div class="notice notice-warning"><p>%s <a href="%s">%s</a></p></div>',
+				esc_html__( 'The AMP plugin performs at its best when persistent object cache is enabled.', 'amp' ),
+				esc_url( 'https://codex.wordpress.org/Class_Reference/WP_Object_Cache#Persistent_Caching' ),
+				esc_html__( 'More details', 'amp' )
+			);
+		}
+	}
+
 }
+

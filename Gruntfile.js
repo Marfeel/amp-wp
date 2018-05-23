@@ -1,6 +1,6 @@
 /* eslint-env node */
 /* jshint node:true */
-/* eslint-disable no-param-reassign */
+/* eslint-disable camelcase, no-console, no-param-reassign */
 
 module.exports = function( grunt ) {
 	'use strict';
@@ -77,7 +77,10 @@ module.exports = function( grunt ) {
 	] );
 
 	grunt.registerTask( 'build', function() {
-		var done = this.async(), spawnQueue = [], stdout = [];
+		var done, spawnQueue, stdout;
+		done = this.async();
+		spawnQueue = [];
+		stdout = [];
 
 		spawnQueue.push(
 			{
@@ -91,17 +94,23 @@ module.exports = function( grunt ) {
 		);
 
 		function finalize() {
-			var commitHash, lsOutput, versionAppend;
+			var commitHash, lsOutput, versionAppend, paths;
 			commitHash = stdout.shift();
 			lsOutput = stdout.shift();
 			versionAppend = commitHash + '-' + new Date().toISOString().replace( /\.\d+/, '' ).replace( /-|:/g, '' );
 
+			paths = lsOutput.trim().split( /\n/ ).filter( function( file ) {
+				return ! /^(blocks|\.|bin|([^/]+)+\.(md|json|xml)|Gruntfile\.js|tests|wp-assets|dev-lib|readme\.md|composer\..*)/.test( file );
+			} );
+			paths.push( 'vendor/autoload.php' );
+			paths.push( 'assets/js/*-compiled.js' );
+			paths.push( 'vendor/composer/**' );
+			paths.push( 'vendor/sabberworm/php-css-parser/lib/**' );
+
 			grunt.task.run( 'clean' );
 			grunt.config.set( 'copy', {
 				build: {
-					src: lsOutput.trim().split( /\n/ ).filter( function( file ) {
-						return ! /^(\.|bin|([^/]+)+\.(md|json|xml)|Gruntfile\.js|tests|wp-assets|dev-lib|readme\.md|composer\..*)/.test( file );
-					} ),
+					src: paths,
 					dest: 'build',
 					expand: true,
 					options: {
@@ -114,7 +123,7 @@ module.exports = function( grunt ) {
 								// If not a stable build (e.g. 0.7.0-beta), amend the version with the git commit and current timestamp.
 								matches = content.match( versionRegex );
 								if ( matches ) {
-									version = matches[2] + '-' + versionAppend;
+									version = matches[ 2 ] + '-' + versionAppend;
 									console.log( 'Updating version in amp.php to ' + version );
 									content = content.replace( versionRegex, '$1' + version );
 									content = content.replace( /(define\(\s*'AMP__VERSION',\s*')(.+?)(?=')/, '$1' + version );
